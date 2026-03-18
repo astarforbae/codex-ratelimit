@@ -59,25 +59,27 @@ python ratelimit_checker.py --live --warning-threshold 80
 Commands used:
 
 ```bash
-python ratelimit_checker.py --recent-days 1 --cost
-cxx 1
-cx 1
+# cxx 1 expands to:
+python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost
+
+# cx 1 expands to (for this benchmark date: 2026-03-18):
+NODE_USE_ENV_PROXY=1 npx -y @ccusage/codex@latest --since 20260318
 ```
 
 Runtime benchmark (same machine):
 
-| Tool | Command | Real Time (s) | Speed vs `cx 1` |
+| Tool | Command | Real Time (s) | Speed vs ccusage |
 |---|---|---:|---:|
-| ccusage | `cx 1` | 12.423 | 1.0x |
-| codex-ratelimit alias | `cxx 1` | 0.371 | 33.5x faster |
-| codex-ratelimit direct | `python ratelimit_checker.py --recent-days 1 --cost` | 0.410 | 30.3x faster |
+| ccusage (`@ccusage/codex`) | `NODE_USE_ENV_PROXY=1 npx -y @ccusage/codex@latest --since 20260318` | 12.423 | 1.0x |
+| codex-ratelimit | `python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost` | 0.371 | 33.5x faster |
+| codex-ratelimit (relative path) | `python ratelimit_checker.py --recent-days 1 --cost` | 0.410 | 30.3x faster |
 
-Result parity snapshot:
+Result parity snapshot (same day, same timezone):
 
-- `cxx 1` (user run): `Cost = $98.87`
-- `cx 1`  (user run): `Cost = $98.87`
+- codex-ratelimit (`python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost`): `Cost = $98.87`
+- ccusage (`NODE_USE_ENV_PROXY=1 npx -y @ccusage/codex@latest --since 20260318`): `Cost = $98.87`
 
-`cxx 1` output:
+codex-ratelimit output (`python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost`):
 
 ```text
 Using default input folder: /home/xingyi/.codex/sessions
@@ -97,7 +99,7 @@ Pricing source: cache_fresh
 └───────────┴───────────────────────────────────────┴─────────┴────────┴────────┴───────────┴────────────┴─────────┘
 ```
 
-`cx 1` output:
+ccusage output (`NODE_USE_ENV_PROXY=1 npx -y @ccusage/codex@latest --since 20260318`):
 
 ```text
 [@ccusage/codex] ℹ Loaded pricing for 2581 models
