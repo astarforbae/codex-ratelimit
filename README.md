@@ -54,6 +54,72 @@ python ratelimit_checker.py --live --warning-threshold 80
 
 ## Sample Output
 
+### Benchmark + Parity Demo (2026-03-18, Asia/Shanghai)
+
+Commands used:
+
+```bash
+python ratelimit_checker.py --recent-days 1 --cost
+cxx 1
+cx 1
+```
+
+Runtime benchmark (same machine):
+
+| Tool | Command | Real Time (s) | Speed vs `cx 1` |
+|---|---|---:|---:|
+| ccusage | `cx 1` | 12.423 | 1.0x |
+| codex-ratelimit alias | `cxx 1` | 0.371 | 33.5x faster |
+| codex-ratelimit direct | `python ratelimit_checker.py --recent-days 1 --cost` | 0.410 | 30.3x faster |
+
+Result parity snapshot:
+
+- `cxx 1` (user run): `Cost = $98.87`
+- `cx 1`  (user run): `Cost = $98.87`
+
+`cxx 1` output:
+
+```text
+Using default input folder: /home/xingyi/.codex/sessions
+Recent 1 day(s) window: 2026-03-18 00:00:00 -> 2026-03-18 19:44:36
+Events: 2033 (scanned files: 23, parse errors: 0)
+Fallback model: gpt-5.3-codex (applied on 0 events)
+Pricing source: cache_fresh
+┌───────────┬───────────────────────────────────────┬─────────┬────────┬────────┬───────────┬────────────┬─────────┐
+│Date       │Models                                 │    Input│  Output│Reasoni…│      Cache│       Total│     Cost│
+│           │                                       │         │        │        │       Read│      Tokens│    (USD)│
+├───────────┼───────────────────────────────────────┼─────────┼────────┼────────┼───────────┼────────────┼─────────┤
+│Mar 18,    │- gpt-5.3-codex                        │24,347,8…│ 738,058│ 215,801│169,921,280│ 195,007,193│   $98.87│
+│2026       │- gpt-5.4                              │         │        │        │           │            │         │
+│           │- gpt-5.4-mini                         │         │        │        │           │            │         │
+├───────────┼───────────────────────────────────────┼─────────┼────────┼────────┼───────────┼────────────┼─────────┤
+│Total      │                                       │24,347,8…│ 738,058│ 215,801│169,921,280│ 195,007,193│   $98.87│
+└───────────┴───────────────────────────────────────┴─────────┴────────┴────────┴───────────┴────────────┴─────────┘
+```
+
+`cx 1` output:
+
+```text
+[@ccusage/codex] ℹ Loaded pricing for 2581 models
+
+ ╭──────────────────────────────────────────────────────────────╮
+ │                                                              │
+ │  Codex Token Usage Report - Daily (Timezone: Asia/Shanghai)  │
+ │                                                              │
+ ╰──────────────────────────────────────────────────────────────╯
+
+┌──────────┬────────────────────────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│ Date     │ Models                     │    Input │   Output │ Reasoni… │    Cache │    Total │     Cost │
+│          │                            │          │          │          │     Read │   Tokens │    (USD) │
+├──────────┼────────────────────────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┤
+│ Mar 18,  │ - gpt-5.3-codex            │ 24,347,… │  738,058 │  215,801 │ 169,921… │ 195,007… │   $98.87 │
+│ 2026     │ - gpt-5.4                  │          │          │          │          │          │          │
+│          │ - gpt-5.4-mini             │          │          │          │          │          │          │
+├──────────┼────────────────────────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┤
+│ Total    │                            │ 24,347,… │  738,058 │  215,801 │ 169,921… │ 195,007… │   $98.87 │
+└──────────┴────────────────────────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
 ### CLI Mode (Text Output)
 
 ```
