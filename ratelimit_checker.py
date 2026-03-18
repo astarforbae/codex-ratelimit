@@ -11,6 +11,8 @@ import json
 import os
 import glob
 import curses
+import hashlib
+import pickle
 import time
 import signal
 import sys
@@ -18,7 +20,7 @@ import unicodedata
 import re
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List, Iterable
 
@@ -34,6 +36,8 @@ CODEX_MODEL_ALIASES = {
 LEGACY_FALLBACK_MODEL = "gpt-5"
 DEFAULT_PRICING_CACHE_TTL_SECONDS = 3600
 DEFAULT_PRICING_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "litellm_pricing_map.json"
+EVENT_INDEX_CACHE_VERSION = 1
+DEFAULT_EVENT_INDEX_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "usage_event_index_v1.pickle"
 
 
 def pad_label_to_width(label: str, target_width: int = LABEL_AREA_WIDTH) -> str:
@@ -95,6 +99,27 @@ def parse_iso_timestamp(timestamp_str: str) -> Optional[datetime]:
         return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
     except (ValueError, TypeError):
         return None
+
+
+def build_token_event_signature(record: Dict[str, Any]) -> Optional[str]:
+    """Build a stable fingerprint for token_count replay dedupe across forked files."""
+    payload = record.get('payload')
+    if not isinstance(payload, dict):
+        return None
+
+    try:
+        canonical = json.dumps(
+            {
+                'payload': payload,
+            },
+            sort_keys=True,
+            separators=(',', ':'),
+            ensure_ascii=True,
+        )
+    except (TypeError, ValueError):
+        return None
+
+    return hashlib.sha1(canonical.encode('utf-8')).hexdigest()
 
 
 def normalize_usage(raw_usage: Any) -> Optional[Dict[str, int]]:
@@ -221,22 +246,11 @@ def read_default_model_from_config() -> Optional[str]:
     return None
 
 
-def iterate_recent_rollout_files(base_path: Path, window_start_local: datetime) -> Iterable[Path]:
-    """
-    Iterate rollout files likely to contain events inside the recent window.
-
-    Uses file mtime as a pre-filter to avoid parsing stale session files.
-    """
+def iterate_all_rollout_files(base_path: Path) -> Iterable[Path]:
+    """Iterate all rollout files in deterministic order."""
     if not base_path.exists():
         return []
-
-    window_start_epoch = window_start_local.timestamp()
-    for file_path in base_path.rglob("rollout-*.jsonl"):
-        try:
-            if file_path.stat().st_mtime >= window_start_epoch:
-                yield file_path
-        except OSError:
-            continue
+    return sorted(base_path.rglob("rollout-*.jsonl"))
 
 
 def get_recent_window_start(recent_days: int, now_local: Optional[datetime] = None) -> datetime:
@@ -316,6 +330,179 @@ def _write_pricing_cache(cache_path: Path, url: str, data: Dict[str, Any]) -> No
     tmp_path.replace(cache_path)
 
 
+def get_event_index_cache_path() -> Path:
+    """Get cache file path for parsed rollout token events."""
+    env_path = os.getenv("CODEX_RATELIMIT_EVENT_CACHE_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
+    return DEFAULT_EVENT_INDEX_CACHE_PATH
+
+
+def _read_event_index_cache(cache_path: Path) -> Dict[str, Any]:
+    """Read parsed token event cache, returning an empty cache on failure."""
+    empty_cache: Dict[str, Any] = {"version": EVENT_INDEX_CACHE_VERSION, "files": {}}
+
+    payload: Any = None
+    try:
+        with open(cache_path, 'rb') as f:
+            payload = pickle.load(f)
+    except (OSError, pickle.UnpicklingError, EOFError, AttributeError, ValueError):
+        payload = None
+
+    # Backward compatibility with old JSON cache format.
+    if payload is None:
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return empty_cache
+
+    if not isinstance(payload, dict):
+        return empty_cache
+    try:
+        version = int(payload.get("version", -1))
+    except (TypeError, ValueError):
+        return empty_cache
+    if version != EVENT_INDEX_CACHE_VERSION:
+        return empty_cache
+
+    files_payload = payload.get("files")
+    if not isinstance(files_payload, dict):
+        return empty_cache
+
+    normalized_files: Dict[str, Dict[str, Any]] = {}
+    for file_key, entry in files_payload.items():
+        if not isinstance(file_key, str) or not isinstance(entry, dict):
+            continue
+        size = entry.get("size")
+        mtime_ns = entry.get("mtime_ns")
+        parse_errors = entry.get("parse_errors", 0)
+        events = entry.get("events")
+        if not isinstance(size, int) or size < 0:
+            continue
+        if not isinstance(mtime_ns, int) or mtime_ns < 0:
+            continue
+        if not isinstance(parse_errors, int) or parse_errors < 0:
+            parse_errors = 0
+        if not isinstance(events, list):
+            continue
+
+        normalized_files[file_key] = {
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "parse_errors": parse_errors,
+            "events": events,
+        }
+
+    return {"version": EVENT_INDEX_CACHE_VERSION, "files": normalized_files}
+
+
+def _write_event_index_cache(cache_path: Path, files_payload: Dict[str, Dict[str, Any]]) -> None:
+    """Write parsed token event cache atomically."""
+    cache_dir = cache_path.parent
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": EVENT_INDEX_CACHE_VERSION,
+        "files": files_payload,
+        "updated_at": time.time(),
+    }
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with open(tmp_path, 'wb') as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path.replace(cache_path)
+
+
+def parse_rollout_file_token_events(file_path: Path) -> Dict[str, Any]:
+    """Parse a rollout file into normalized token_count events for caching."""
+    parse_errors = 0
+    events: List[Dict[str, Any]] = []
+    current_model: Optional[str] = None
+    previous_totals: Optional[Dict[str, int]] = None
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if 'token_count' not in line and 'turn_context' not in line:
+                continue
+
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                parse_errors += 1
+                continue
+
+            if not isinstance(record, dict):
+                continue
+
+            entry_type = record.get('type')
+            payload = record.get('payload')
+            if not isinstance(payload, dict):
+                continue
+
+            if entry_type == 'turn_context':
+                context_model = extract_model_from_object(payload)
+                if context_model:
+                    current_model = context_model
+                continue
+
+            if entry_type != 'event_msg':
+                continue
+            if payload.get('type') != 'token_count':
+                continue
+
+            timestamp = parse_iso_timestamp(record.get('timestamp', ''))
+            if timestamp is None:
+                continue
+
+            info = payload.get('info')
+            if not isinstance(info, dict):
+                continue
+
+            last_usage = normalize_usage(info.get('last_token_usage'))
+            total_usage = normalize_usage(info.get('total_token_usage'))
+            raw_usage = last_usage
+            if raw_usage is None and total_usage is not None:
+                raw_usage = subtract_usage(total_usage, previous_totals)
+
+            if total_usage is not None:
+                previous_totals = total_usage
+
+            if raw_usage is None or not usage_has_tokens(raw_usage):
+                continue
+
+            signature = build_token_event_signature(record)
+            if not signature:
+                continue
+
+            extracted_model = extract_model_from_object({
+                'info': info,
+                'model': payload.get('model'),
+                'metadata': payload.get('metadata'),
+            })
+            if extracted_model:
+                current_model = extracted_model
+
+            model_candidate = extracted_model or current_model
+            timestamp_utc = timestamp.astimezone(timezone.utc)
+            events.append({
+                "timestamp": timestamp_utc.timestamp(),
+                "signature": signature,
+                "model": model_candidate,
+                "input_tokens": int(raw_usage.get('input_tokens', 0) or 0),
+                "cached_input_tokens": int(raw_usage.get('cached_input_tokens', 0) or 0),
+                "output_tokens": int(raw_usage.get('output_tokens', 0) or 0),
+                "reasoning_output_tokens": int(raw_usage.get('reasoning_output_tokens', 0) or 0),
+                "total_tokens": int(raw_usage.get('total_tokens', 0) or 0),
+            })
+
+    return {
+        "parse_errors": parse_errors,
+        "events": events,
+    }
+
+
 def load_recent_usage_events(
     base_path: Path,
     recent_days: int,
@@ -324,99 +511,135 @@ def load_recent_usage_events(
     """Load token usage events in the recent-days window with model attribution."""
     now_local = datetime.now().astimezone()
     window_start_local = get_recent_window_start(recent_days, now_local=now_local)
+    now_utc = now_local.astimezone(timezone.utc)
+    window_start_utc = window_start_local.astimezone(timezone.utc)
+    now_utc_epoch = now_utc.timestamp()
+    window_start_utc_epoch = window_start_utc.timestamp()
 
     events: List[Dict[str, Any]] = []
+    seen_event_signatures: set[str] = set()
+    deduplicated_events = 0
     scanned_files = 0
     parse_errors = 0
     fallback_model_name = fallback_model or LEGACY_FALLBACK_MODEL
 
-    for file_path in iterate_recent_rollout_files(base_path, window_start_local):
-        scanned_files += 1
-        current_model: Optional[str] = None
-        previous_totals: Optional[Dict[str, int]] = None
+    rollout_files = list(iterate_all_rollout_files(base_path))
+    scanned_files = len(rollout_files)
 
+    cache_path = get_event_index_cache_path()
+    cache_payload = _read_event_index_cache(cache_path)
+    cached_files: Dict[str, Dict[str, Any]] = cache_payload.get("files", {})
+    refreshed_files: Dict[str, Dict[str, Any]] = {}
+    cache_changed = False
+
+    for file_path in rollout_files:
+        file_key = str(file_path)
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                for raw_line in f:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        parse_errors += 1
-                        continue
-
-                    if not isinstance(record, dict):
-                        continue
-
-                    entry_type = record.get('type')
-                    payload = record.get('payload')
-                    if not isinstance(payload, dict):
-                        continue
-
-                    if entry_type == 'turn_context':
-                        context_model = extract_model_from_object(payload)
-                        if context_model:
-                            current_model = context_model
-                        continue
-
-                    if entry_type != 'event_msg':
-                        continue
-
-                    if payload.get('type') != 'token_count':
-                        continue
-
-                    timestamp = parse_iso_timestamp(record.get('timestamp', ''))
-                    if timestamp is None:
-                        continue
-
-                    timestamp_local = timestamp.astimezone()
-                    if timestamp_local < window_start_local or timestamp_local > now_local:
-                        continue
-
-                    info = payload.get('info')
-                    if not isinstance(info, dict):
-                        continue
-
-                    last_usage = normalize_usage(info.get('last_token_usage'))
-                    total_usage = normalize_usage(info.get('total_token_usage'))
-
-                    raw_usage = last_usage
-                    if raw_usage is None and total_usage is not None:
-                        raw_usage = subtract_usage(total_usage, previous_totals)
-
-                    if total_usage is not None:
-                        previous_totals = total_usage
-
-                    if raw_usage is None or not usage_has_tokens(raw_usage):
-                        continue
-
-                    extracted_model = extract_model_from_object({
-                        'info': info,
-                        'model': payload.get('model'),
-                        'metadata': payload.get('metadata'),
-                    })
-                    if extracted_model:
-                        current_model = extracted_model
-
-                    model_name = extracted_model or current_model or fallback_model_name
-                    used_fallback = (extracted_model is None and current_model is None)
-
-                    events.append({
-                        'timestamp': timestamp,
-                        'timestamp_local': timestamp_local,
-                        'model': model_name,
-                        'input_tokens': raw_usage.get('input_tokens', 0),
-                        'cached_input_tokens': raw_usage.get('cached_input_tokens', 0),
-                        'output_tokens': raw_usage.get('output_tokens', 0),
-                        'reasoning_output_tokens': raw_usage.get('reasoning_output_tokens', 0),
-                        'total_tokens': raw_usage.get('total_tokens', 0),
-                        'used_fallback_model': used_fallback,
-                    })
+            stat_result = file_path.stat()
         except OSError:
+            cache_changed = cache_changed or (file_key in cached_files)
             continue
+
+        size = int(stat_result.st_size)
+        mtime_ns = int(stat_result.st_mtime_ns)
+        cached_entry = cached_files.get(file_key)
+        cached_size = None
+        cached_mtime_ns = None
+        if isinstance(cached_entry, dict):
+            try:
+                cached_size = int(cached_entry.get("size", -1))
+            except (TypeError, ValueError):
+                cached_size = None
+            try:
+                cached_mtime_ns = int(cached_entry.get("mtime_ns", -1))
+            except (TypeError, ValueError):
+                cached_mtime_ns = None
+
+        if (
+            isinstance(cached_entry, dict)
+            and cached_size == size
+            and cached_mtime_ns == mtime_ns
+            and isinstance(cached_entry.get("events"), list)
+        ):
+            entry = cached_entry
+        else:
+            try:
+                parsed = parse_rollout_file_token_events(file_path)
+            except OSError:
+                cache_changed = cache_changed or (file_key in cached_files)
+                continue
+            entry = {
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "parse_errors": int(parsed.get("parse_errors", 0) or 0),
+                "events": parsed.get("events", []),
+            }
+            cache_changed = True
+
+        refreshed_files[file_key] = entry
+        parse_errors += int(entry.get("parse_errors", 0) or 0)
+
+    if len(refreshed_files) != len(cached_files):
+        cache_changed = True
+
+    if cache_changed:
+        try:
+            _write_event_index_cache(cache_path, refreshed_files)
+        except OSError:
+            pass
+
+    for file_path in rollout_files:
+        file_key = str(file_path)
+        entry = refreshed_files.get(file_key)
+        if not isinstance(entry, dict):
+            continue
+        file_events = entry.get("events")
+        if not isinstance(file_events, list):
+            continue
+
+        for cached_event in file_events:
+            if not isinstance(cached_event, dict):
+                continue
+
+            try:
+                timestamp_epoch = float(cached_event.get("timestamp"))
+            except (TypeError, ValueError):
+                continue
+            if timestamp_epoch > now_utc_epoch:
+                continue
+
+            signature = cached_event.get("signature")
+            if not isinstance(signature, str) or not signature:
+                continue
+            if signature in seen_event_signatures:
+                deduplicated_events += 1
+                continue
+            seen_event_signatures.add(signature)
+
+            if timestamp_epoch < window_start_utc_epoch:
+                continue
+
+            timestamp = datetime.fromtimestamp(timestamp_epoch, tz=timezone.utc)
+            timestamp_local = timestamp.astimezone()
+            model_candidate = cached_event.get("model")
+            if isinstance(model_candidate, str):
+                stripped_model = model_candidate.strip()
+            else:
+                stripped_model = ""
+            has_model = bool(stripped_model)
+            model_name = stripped_model if has_model else fallback_model_name
+
+            events.append({
+                'timestamp': timestamp,
+                'timestamp_local': timestamp_local,
+                'model': model_name,
+                'input_tokens': int(cached_event.get('input_tokens', 0) or 0),
+                'cached_input_tokens': int(cached_event.get('cached_input_tokens', 0) or 0),
+                'output_tokens': int(cached_event.get('output_tokens', 0) or 0),
+                'reasoning_output_tokens': int(cached_event.get('reasoning_output_tokens', 0) or 0),
+                'total_tokens': int(cached_event.get('total_tokens', 0) or 0),
+                'used_fallback_model': not has_model,
+            })
 
     events.sort(key=lambda e: e['timestamp'])
     return {
@@ -425,6 +648,7 @@ def load_recent_usage_events(
         'window_end_local': now_local,
         'scanned_files': scanned_files,
         'parse_errors': parse_errors,
+        'deduplicated_events': deduplicated_events,
         'fallback_model': fallback_model_name,
     }
 
@@ -814,6 +1038,7 @@ def summarize_recent_usage_with_cost(
         'event_count': len(events),
         'scanned_files': events_data['scanned_files'],
         'parse_errors': events_data['parse_errors'],
+        'deduplicated_event_count': events_data.get('deduplicated_events', 0),
         'fallback_model': default_model,
         'fallback_event_count': fallback_events,
         'totals': totals,
@@ -1534,6 +1759,7 @@ def main():
                 "events": summary['event_count'],
                 "scanned_files": summary['scanned_files'],
                 "parse_errors": summary['parse_errors'],
+                "deduplicated_events": summary.get('deduplicated_event_count', 0),
                 "fallback_model": summary['fallback_model'],
                 "fallback_event_count": summary['fallback_event_count'],
                 "cost_enabled": summary['cost_enabled'],
@@ -1575,7 +1801,11 @@ def main():
             window_start = summary['window_start_local'].strftime('%Y-%m-%d %H:%M:%S')
             window_end = summary['window_end_local'].strftime('%Y-%m-%d %H:%M:%S')
             print(f"Recent {summary['recent_days']} day(s) window: {window_start} -> {window_end}")
-            print(f"Events: {summary['event_count']} (scanned files: {summary['scanned_files']}, parse errors: {summary['parse_errors']})")
+            deduped = summary.get('deduplicated_event_count', 0)
+            print(
+                f"Events: {summary['event_count']} "
+                f"(scanned files: {summary['scanned_files']}, parse errors: {summary['parse_errors']}, deduplicated: {deduped})"
+            )
             print(f"Fallback model: {summary['fallback_model']} (applied on {summary['fallback_event_count']} events)")
             if summary['cost_enabled']:
                 if summary.get('pricing_source'):
