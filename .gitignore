@@ -1,1 +1,3 @@
 test_scenarios/
+__pycache__/
+.cache/

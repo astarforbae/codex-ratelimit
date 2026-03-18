@@ -36,6 +36,12 @@ python ratelimit_checker.py --input-folder /path/to/sessions
 # Output in JSON format
 python ratelimit_checker.py --json
 
+# Aggregate today's usage and estimate USD value from LiteLLM pricing
+python ratelimit_checker.py --recent-days 1 --cost
+
+# Aggregate recent 3 days in JSON format
+python ratelimit_checker.py --recent-days 3 --json --cost
+
 # Launch live TUI monitoring interface
 python ratelimit_checker.py --live
 
@@ -117,6 +123,8 @@ python ratelimit_checker.py [OPTIONS]
 Options:
   -h, --help                    Show help message
   -i, --input-folder PATH       Custom input folder path (default: ~/.codex/sessions)
+  --recent-days N               Aggregate usage for recent N days (N=1 means today)
+  --cost                        Enable USD cost estimation from LiteLLM pricing map (default: off)
   --json                        Output data in JSON format
   --live                        Launch TUI live monitoring interface
   --interval SECONDS            Refresh interval in seconds for live mode (default: 10)
@@ -160,6 +168,22 @@ The utility expects CODEX session files in this structure:
 2. Examines all `rollout-*.jsonl` files to find `token_count` events
 3. Selects the most recent event based on timestamp
 4. Extracts and formats token usage and rate limit data
+
+With `--recent-days`, it additionally:
+
+1. Scans all session JSONL files and keeps events within the recent-day local-time window
+2. Tracks active model from `turn_context` entries
+3. Aggregates token deltas and maps model pricing from LiteLLM
+4. Computes estimated USD per model and total
+5. Prints a daily summary table with Date / Models / Input / Output / Reasoning / Cache Read / Total Tokens / Cost
+
+Performance notes:
+
+- `--recent-days` pre-filters rollout files by file mtime, so it only parses recently updated session files.
+- `--cost` uses a local LiteLLM pricing cache at `.cache/litellm_pricing_map.json` (default TTL: 3600s).
+- Cache knobs (optional):
+  - `CODEX_RATELIMIT_PRICING_CACHE_TTL_SECONDS`
+  - `CODEX_RATELIMIT_PRICING_CACHE_PATH`
 
 
 ## Requirements

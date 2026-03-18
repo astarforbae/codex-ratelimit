@@ -15,14 +15,25 @@ import time
 import signal
 import sys
 import unicodedata
+import re
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List, Iterable
 
 
 
 LABEL_AREA_WIDTH = 12
 BAR_WIDTH = 46
+LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+CODEX_PROVIDER_PREFIXES = ("openai/", "azure/", "openrouter/openai/")
+CODEX_MODEL_ALIASES = {
+    "gpt-5-codex": "gpt-5",
+}
+LEGACY_FALLBACK_MODEL = "gpt-5"
+DEFAULT_PRICING_CACHE_TTL_SECONDS = 3600
+DEFAULT_PRICING_CACHE_PATH = Path(__file__).resolve().parent / ".cache" / "litellm_pricing_map.json"
 
 
 def pad_label_to_width(label: str, target_width: int = LABEL_AREA_WIDTH) -> str:
@@ -73,6 +84,749 @@ def get_session_base_path(custom_path: Optional[str] = None) -> Path:
     if custom_path:
         return Path(custom_path).expanduser()
     return Path.home() / ".codex" / "sessions"
+
+
+def parse_iso_timestamp(timestamp_str: str) -> Optional[datetime]:
+    """Parse an ISO timestamp string to a timezone-aware datetime."""
+    if not timestamp_str:
+        return None
+
+    try:
+        return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+
+
+def normalize_usage(raw_usage: Any) -> Optional[Dict[str, int]]:
+    """Normalize raw usage payload to integer counters."""
+    if not isinstance(raw_usage, dict):
+        return None
+
+    fields = (
+        'input_tokens',
+        'cached_input_tokens',
+        'output_tokens',
+        'reasoning_output_tokens',
+        'total_tokens',
+    )
+    normalized = {}
+    has_any_value = False
+
+    for field in fields:
+        value = raw_usage.get(field, 0)
+        try:
+            parsed_value = int(value)
+        except (TypeError, ValueError):
+            parsed_value = 0
+
+        if parsed_value < 0:
+            parsed_value = 0
+
+        if parsed_value > 0:
+            has_any_value = True
+
+        normalized[field] = parsed_value
+
+    if not has_any_value:
+        return None
+
+    return normalized
+
+
+def subtract_usage(current: Dict[str, int], previous: Optional[Dict[str, int]]) -> Dict[str, int]:
+    """Subtract two cumulative usage snapshots and clamp at zero."""
+    if previous is None:
+        return dict(current)
+
+    result = {}
+    for field in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'):
+        result[field] = max(0, current.get(field, 0) - previous.get(field, 0))
+    return result
+
+
+def usage_has_tokens(usage: Dict[str, int]) -> bool:
+    """Check whether usage contains non-zero token counters."""
+    return any(
+        usage.get(field, 0) > 0
+        for field in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens')
+    )
+
+
+def extract_model_from_object(value: Any) -> Optional[str]:
+    """
+    Extract model name from nested payloads.
+
+    Extraction order mirrors ccusage behavior:
+    - info.model / info.model_name / info.metadata.model
+    - model
+    - metadata.model
+    """
+    if not isinstance(value, dict):
+        return None
+
+    def as_non_empty_string(candidate: Any) -> Optional[str]:
+        if not isinstance(candidate, str):
+            return None
+        stripped = candidate.strip()
+        return stripped if stripped else None
+
+    info = value.get('info')
+    if isinstance(info, dict):
+        for candidate in (info.get('model'), info.get('model_name')):
+            model = as_non_empty_string(candidate)
+            if model:
+                return model
+
+        info_metadata = info.get('metadata')
+        if isinstance(info_metadata, dict):
+            model = as_non_empty_string(info_metadata.get('model'))
+            if model:
+                return model
+
+    model = as_non_empty_string(value.get('model'))
+    if model:
+        return model
+
+    metadata = value.get('metadata')
+    if isinstance(metadata, dict):
+        model = as_non_empty_string(metadata.get('model'))
+        if model:
+            return model
+
+    return None
+
+
+def read_default_model_from_config() -> Optional[str]:
+    """Read the global default model from ~/.codex/config.toml."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return None
+
+    model_pattern = re.compile(r'^\s*model\s*=\s*"([^"]+)"\s*$')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if line.startswith('['):
+                    # We only care about top-level keys before sections.
+                    break
+                match = model_pattern.match(line)
+                if match:
+                    model = match.group(1).strip()
+                    if model:
+                        return model
+    except OSError:
+        return None
+
+    return None
+
+
+def iterate_recent_rollout_files(base_path: Path, window_start_local: datetime) -> Iterable[Path]:
+    """
+    Iterate rollout files likely to contain events inside the recent window.
+
+    Uses file mtime as a pre-filter to avoid parsing stale session files.
+    """
+    if not base_path.exists():
+        return []
+
+    window_start_epoch = window_start_local.timestamp()
+    for file_path in base_path.rglob("rollout-*.jsonl"):
+        try:
+            if file_path.stat().st_mtime >= window_start_epoch:
+                yield file_path
+        except OSError:
+            continue
+
+
+def get_recent_window_start(recent_days: int, now_local: Optional[datetime] = None) -> datetime:
+    """Get local-time window start for recent-days filter."""
+    if now_local is None:
+        now_local = datetime.now().astimezone()
+    day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start - timedelta(days=recent_days - 1)
+
+
+def _read_int_env(name: str, default: int) -> int:
+    """Read integer env var with fallback."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def get_pricing_cache_ttl_seconds() -> int:
+    """Get pricing cache TTL in seconds."""
+    return _read_int_env("CODEX_RATELIMIT_PRICING_CACHE_TTL_SECONDS", DEFAULT_PRICING_CACHE_TTL_SECONDS)
+
+
+def get_pricing_cache_path() -> Path:
+    """Get cache file path for LiteLLM pricing data."""
+    env_path = os.getenv("CODEX_RATELIMIT_PRICING_CACHE_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
+    return DEFAULT_PRICING_CACHE_PATH
+
+
+def _read_pricing_cache(cache_path: Path) -> Optional[Dict[str, Any]]:
+    """Read pricing cache payload if available."""
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            cached = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(cached, dict):
+        return None
+
+    data = cached.get("data")
+    fetched_at = cached.get("fetched_at")
+    url = cached.get("url")
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(fetched_at, (int, float)):
+        return None
+    if not isinstance(url, str):
+        return None
+
+    return {
+        "url": url,
+        "fetched_at": float(fetched_at),
+        "data": data,
+    }
+
+
+def _write_pricing_cache(cache_path: Path, url: str, data: Dict[str, Any]) -> None:
+    """Write pricing cache payload atomically."""
+    cache_dir = cache_path.parent
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "url": url,
+        "fetched_at": time.time(),
+        "data": data,
+    }
+
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f)
+    tmp_path.replace(cache_path)
+
+
+def load_recent_usage_events(
+    base_path: Path,
+    recent_days: int,
+    fallback_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Load token usage events in the recent-days window with model attribution."""
+    now_local = datetime.now().astimezone()
+    window_start_local = get_recent_window_start(recent_days, now_local=now_local)
+
+    events: List[Dict[str, Any]] = []
+    scanned_files = 0
+    parse_errors = 0
+    fallback_model_name = fallback_model or LEGACY_FALLBACK_MODEL
+
+    for file_path in iterate_recent_rollout_files(base_path, window_start_local):
+        scanned_files += 1
+        current_model: Optional[str] = None
+        previous_totals: Optional[Dict[str, int]] = None
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        parse_errors += 1
+                        continue
+
+                    if not isinstance(record, dict):
+                        continue
+
+                    entry_type = record.get('type')
+                    payload = record.get('payload')
+                    if not isinstance(payload, dict):
+                        continue
+
+                    if entry_type == 'turn_context':
+                        context_model = extract_model_from_object(payload)
+                        if context_model:
+                            current_model = context_model
+                        continue
+
+                    if entry_type != 'event_msg':
+                        continue
+
+                    if payload.get('type') != 'token_count':
+                        continue
+
+                    timestamp = parse_iso_timestamp(record.get('timestamp', ''))
+                    if timestamp is None:
+                        continue
+
+                    timestamp_local = timestamp.astimezone()
+                    if timestamp_local < window_start_local or timestamp_local > now_local:
+                        continue
+
+                    info = payload.get('info')
+                    if not isinstance(info, dict):
+                        continue
+
+                    last_usage = normalize_usage(info.get('last_token_usage'))
+                    total_usage = normalize_usage(info.get('total_token_usage'))
+
+                    raw_usage = last_usage
+                    if raw_usage is None and total_usage is not None:
+                        raw_usage = subtract_usage(total_usage, previous_totals)
+
+                    if total_usage is not None:
+                        previous_totals = total_usage
+
+                    if raw_usage is None or not usage_has_tokens(raw_usage):
+                        continue
+
+                    extracted_model = extract_model_from_object({
+                        'info': info,
+                        'model': payload.get('model'),
+                        'metadata': payload.get('metadata'),
+                    })
+                    if extracted_model:
+                        current_model = extracted_model
+
+                    model_name = extracted_model or current_model or fallback_model_name
+                    used_fallback = (extracted_model is None and current_model is None)
+
+                    events.append({
+                        'timestamp': timestamp,
+                        'timestamp_local': timestamp_local,
+                        'model': model_name,
+                        'input_tokens': raw_usage.get('input_tokens', 0),
+                        'cached_input_tokens': raw_usage.get('cached_input_tokens', 0),
+                        'output_tokens': raw_usage.get('output_tokens', 0),
+                        'reasoning_output_tokens': raw_usage.get('reasoning_output_tokens', 0),
+                        'total_tokens': raw_usage.get('total_tokens', 0),
+                        'used_fallback_model': used_fallback,
+                    })
+        except OSError:
+            continue
+
+    events.sort(key=lambda e: e['timestamp'])
+    return {
+        'events': events,
+        'window_start_local': window_start_local,
+        'window_end_local': now_local,
+        'scanned_files': scanned_files,
+        'parse_errors': parse_errors,
+        'fallback_model': fallback_model_name,
+    }
+
+
+def load_litellm_pricing_map(
+    url: str = LITELLM_PRICING_URL,
+    cache_path: Optional[Path] = None,
+    cache_ttl_seconds: Optional[int] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """
+    Load LiteLLM pricing map with local cache.
+
+    Returns:
+        (pricing_map, source), where source is one of:
+        - "cache_fresh"
+        - "network"
+        - "cache_stale_fallback"
+    """
+    actual_cache_path = cache_path or get_pricing_cache_path()
+    ttl_seconds = cache_ttl_seconds if cache_ttl_seconds is not None else get_pricing_cache_ttl_seconds()
+
+    cached_payload = _read_pricing_cache(actual_cache_path)
+    if cached_payload and cached_payload.get("url") == url:
+        age_seconds = max(0.0, time.time() - float(cached_payload["fetched_at"]))
+        if age_seconds <= ttl_seconds:
+            return cached_payload["data"], "cache_fresh"
+
+    try:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            body = response.read().decode('utf-8')
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("Pricing map is not a JSON object")
+        _write_pricing_cache(actual_cache_path, url, data)
+        return data, "network"
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError):
+        if cached_payload and cached_payload.get("url") == url:
+            return cached_payload["data"], "cache_stale_fallback"
+        raise
+
+
+def resolve_model_pricing(
+    model_name: str,
+    pricing_map: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve pricing entry for a model via exact/prefix/alias/fuzzy matching."""
+    aliases = [model_name]
+    alias = CODEX_MODEL_ALIASES.get(model_name)
+    if alias:
+        aliases.append(alias)
+
+    for candidate in aliases:
+        if candidate in pricing_map and isinstance(pricing_map[candidate], dict):
+            return candidate, pricing_map[candidate]
+
+    prefixed_candidates = []
+    for base in aliases:
+        for prefix in CODEX_PROVIDER_PREFIXES:
+            prefixed_candidates.append(f"{prefix}{base}")
+
+    for candidate in prefixed_candidates:
+        if candidate in pricing_map and isinstance(pricing_map[candidate], dict):
+            return candidate, pricing_map[candidate]
+
+    lower_aliases = [a.lower() for a in aliases]
+    for key, value in pricing_map.items():
+        if not isinstance(value, dict):
+            continue
+        key_lower = key.lower()
+        for lower_model in lower_aliases:
+            if lower_model in key_lower or key_lower in lower_model:
+                return key, value
+
+    return None, None
+
+
+def usage_totals_template() -> Dict[str, int]:
+    """Create an empty usage totals dictionary."""
+    return {
+        'input_tokens': 0,
+        'cached_input_tokens': 0,
+        'output_tokens': 0,
+        'reasoning_output_tokens': 0,
+        'total_tokens': 0,
+    }
+
+
+def add_usage(acc: Dict[str, int], delta: Dict[str, Any]) -> None:
+    """Accumulate usage counters."""
+    for field in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'):
+        acc[field] += int(delta.get(field, 0) or 0)
+
+
+def calculate_usage_cost_usd(usage: Dict[str, int], pricing: Dict[str, Any]) -> float:
+    """Calculate USD cost with ccusage-compatible token accounting."""
+    input_price = float(pricing.get('input_cost_per_token') or 0.0)
+    cached_price = float(pricing.get('cache_read_input_token_cost') or input_price or 0.0)
+    output_price = float(pricing.get('output_cost_per_token') or 0.0)
+    input_tokens = int(usage.get('input_tokens', 0) or 0)
+    cached_tokens_raw = int(usage.get('cached_input_tokens', 0) or 0)
+    output_tokens = int(usage.get('output_tokens', 0) or 0)
+
+    # Match ccusage: input is non-cached input, cached is capped by input.
+    cached_tokens = min(cached_tokens_raw, input_tokens)
+    non_cached_input_tokens = max(0, input_tokens - cached_tokens)
+
+    input_cost = non_cached_input_tokens * input_price
+    output_cost = usage.get('output_tokens', 0) * output_price
+    cached_cost = cached_tokens * cached_price
+
+    return input_cost + cached_cost + output_cost
+
+
+def usage_to_table_metrics(usage: Dict[str, int]) -> Dict[str, int]:
+    """Convert raw usage counters to ccusage-style table metrics."""
+    input_tokens = int(usage.get('input_tokens', 0) or 0)
+    cached_tokens_raw = int(usage.get('cached_input_tokens', 0) or 0)
+    output_tokens = int(usage.get('output_tokens', 0) or 0)
+    reasoning_tokens = int(usage.get('reasoning_output_tokens', 0) or 0)
+
+    cached_read_tokens = min(cached_tokens_raw, input_tokens)
+    non_cached_input_tokens = max(0, input_tokens - cached_read_tokens)
+    total_tokens = non_cached_input_tokens + cached_read_tokens + output_tokens
+
+    return {
+        'input_tokens': non_cached_input_tokens,
+        'cached_input_tokens': cached_read_tokens,
+        'output_tokens': output_tokens,
+        'reasoning_output_tokens': reasoning_tokens,
+        'total_tokens': total_tokens,
+    }
+
+
+def _truncate_with_ellipsis(text: str, width: int) -> str:
+    """Truncate text to width with trailing ellipsis."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[:width - 1] + "…"
+
+
+def _format_table_cell(text: str, width: int, align: str = "left") -> str:
+    """Format a single table cell with truncation and alignment."""
+    clipped = _truncate_with_ellipsis(text, width)
+    if align == "right":
+        return clipped.rjust(width)
+    return clipped.ljust(width)
+
+
+def _format_count_for_table(value: int, width: int) -> str:
+    """Format numeric count for fixed-width table cells."""
+    return _format_table_cell(f"{int(value):,}", width, align="right")
+
+
+def _format_cost_for_table(cost_usd: Optional[float], width: int) -> str:
+    """Format USD value for fixed-width table cells."""
+    if cost_usd is None:
+        return _format_table_cell("-", width, align="right")
+    return _format_table_cell(f"${cost_usd:,.2f}", width, align="right")
+
+
+def render_recent_usage_table(summary: Dict[str, Any]) -> str:
+    """Render recent usage summary as a box-drawing table."""
+    columns = [
+        ("Date", 11, "left"),
+        ("Models", 39, "left"),
+        ("Input", 9, "right"),
+        ("Output", 8, "right"),
+        ("Reasoni…", 8, "right"),
+        ("Cache", 11, "right"),
+        ("Total", 12, "right"),
+        ("Cost", 9, "right"),
+    ]
+    sub_header = ["", "", "", "", "", "Read", "Tokens", "(USD)"]
+
+    widths = [c[1] for c in columns]
+    aligns = [c[2] for c in columns]
+
+    def build_separator(left: str, mid: str, right: str) -> str:
+        return left + mid.join("─" * width for width in widths) + right
+
+    def build_row(cells: List[str]) -> str:
+        parts = []
+        for idx, cell in enumerate(cells):
+            parts.append(_format_table_cell(cell, widths[idx], align=aligns[idx]))
+        return "│" + "│".join(parts) + "│"
+
+    lines = []
+    lines.append(build_separator("┌", "┬", "┐"))
+    lines.append(build_row([c[0] for c in columns]))
+    lines.append(build_row(sub_header))
+    lines.append(build_separator("├", "┼", "┤"))
+
+    daily_rows: List[Dict[str, Any]] = summary.get('daily', [])
+    for row_idx, day_row in enumerate(daily_rows):
+        date_key = day_row.get('date', '')
+        try:
+            dt = datetime.strptime(date_key, "%Y-%m-%d")
+            date_lines = [f"{dt.strftime('%b')} {dt.day},", f"{dt.year}"]
+        except ValueError:
+            date_lines = [date_key]
+
+        model_lines = [f"- {name}" for name in day_row.get('models', [])]
+        if not model_lines:
+            model_lines = [""]
+
+        usage_metrics = usage_to_table_metrics(day_row.get('usage', {}))
+        numeric_first_line = [
+            _format_count_for_table(usage_metrics['input_tokens'], widths[2]),
+            _format_count_for_table(usage_metrics['output_tokens'], widths[3]),
+            _format_count_for_table(usage_metrics['reasoning_output_tokens'], widths[4]),
+            _format_count_for_table(usage_metrics['cached_input_tokens'], widths[5]),
+            _format_count_for_table(usage_metrics['total_tokens'], widths[6]),
+            _format_cost_for_table(day_row.get('usd'), widths[7]),
+        ]
+        numeric_blank_line = [" " * widths[2], " " * widths[3], " " * widths[4], " " * widths[5], " " * widths[6], " " * widths[7]]
+
+        line_count = max(len(date_lines), len(model_lines))
+        for i in range(line_count):
+            date_cell = date_lines[i] if i < len(date_lines) else ""
+            model_cell = model_lines[i] if i < len(model_lines) else ""
+            nums = numeric_first_line if i == 0 else numeric_blank_line
+            lines.append(
+                "│" + "│".join(
+                    [
+                        _format_table_cell(date_cell, widths[0], aligns[0]),
+                        _format_table_cell(model_cell, widths[1], aligns[1]),
+                        nums[0],
+                        nums[1],
+                        nums[2],
+                        nums[3],
+                        nums[4],
+                        nums[5],
+                    ]
+                ) + "│"
+            )
+
+        if row_idx != len(daily_rows) - 1:
+            lines.append(build_separator("├", "┼", "┤"))
+
+    if daily_rows:
+        lines.append(build_separator("├", "┼", "┤"))
+
+    total_metrics = usage_to_table_metrics(summary.get('totals', {}))
+    total_row = [
+        "Total",
+        "",
+        _format_count_for_table(total_metrics['input_tokens'], widths[2]),
+        _format_count_for_table(total_metrics['output_tokens'], widths[3]),
+        _format_count_for_table(total_metrics['reasoning_output_tokens'], widths[4]),
+        _format_count_for_table(total_metrics['cached_input_tokens'], widths[5]),
+        _format_count_for_table(total_metrics['total_tokens'], widths[6]),
+        _format_cost_for_table(summary.get('usd_total') if summary.get('cost_enabled') else None, widths[7]),
+    ]
+    lines.append(
+        "│" + "│".join(
+            [
+                _format_table_cell(total_row[0], widths[0], aligns[0]),
+                _format_table_cell(total_row[1], widths[1], aligns[1]),
+                total_row[2],
+                total_row[3],
+                total_row[4],
+                total_row[5],
+                total_row[6],
+                total_row[7],
+            ]
+        ) + "│"
+    )
+    lines.append(build_separator("└", "┴", "┘"))
+
+    return "\n".join(lines)
+
+
+def summarize_recent_usage_with_cost(
+    base_path: Path,
+    recent_days: int,
+    enable_cost: bool = False,
+    pricing_url: str = LITELLM_PRICING_URL,
+) -> Dict[str, Any]:
+    """Summarize recent token usage and estimate USD cost by model."""
+    default_model = read_default_model_from_config() or LEGACY_FALLBACK_MODEL
+    events_data = load_recent_usage_events(base_path, recent_days, fallback_model=default_model)
+    events = events_data['events']
+
+    totals = usage_totals_template()
+    model_usage: Dict[str, Dict[str, int]] = {}
+    daily_usage: Dict[str, Dict[str, Any]] = {}
+    fallback_events = 0
+
+    for event in events:
+        add_usage(totals, event)
+        model_name = event.get('model') or default_model
+        if model_name not in model_usage:
+            model_usage[model_name] = usage_totals_template()
+        add_usage(model_usage[model_name], event)
+
+        timestamp_local = event.get('timestamp_local')
+        if isinstance(timestamp_local, datetime):
+            day_key = timestamp_local.strftime('%Y-%m-%d')
+        else:
+            day_key = event.get('timestamp').astimezone().strftime('%Y-%m-%d')
+
+        if day_key not in daily_usage:
+            daily_usage[day_key] = {
+                'usage': usage_totals_template(),
+                'models': {},
+            }
+        add_usage(daily_usage[day_key]['usage'], event)
+
+        day_models = daily_usage[day_key]['models']
+        if model_name not in day_models:
+            day_models[model_name] = usage_totals_template()
+        add_usage(day_models[model_name], event)
+
+        if event.get('used_fallback_model'):
+            fallback_events += 1
+
+    pricing_enabled = bool(enable_cost)
+    pricing_warning = None
+    pricing_source = None
+    pricing_map = None
+    model_breakdown = {}
+    total_cost_usd = 0.0
+    priced_models = 0
+    unpriced_models = 0
+
+    if pricing_enabled:
+        try:
+            pricing_map, pricing_source = load_litellm_pricing_map(url=pricing_url)
+            if pricing_source == "cache_stale_fallback":
+                pricing_warning = "Using stale cached pricing data because refresh failed"
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as e:
+            pricing_warning = f"Failed to load pricing map: {e}"
+
+    for model_name, usage in sorted(model_usage.items()):
+        matched_model, pricing = (None, None)
+        model_cost = None
+        if pricing_map is not None:
+            matched_model, pricing = resolve_model_pricing(model_name, pricing_map)
+            if pricing is not None:
+                model_cost = calculate_usage_cost_usd(usage, pricing)
+                total_cost_usd += model_cost
+                priced_models += 1
+            else:
+                unpriced_models += 1
+        else:
+            unpriced_models += 1
+
+        model_breakdown[model_name] = {
+            'usage': usage,
+            'usd': model_cost,
+            'pricing_model': matched_model,
+        }
+
+    daily_rows: List[Dict[str, Any]] = []
+    for day_key in sorted(daily_usage.keys()):
+        day_payload = daily_usage[day_key]
+        day_models_usage: Dict[str, Dict[str, int]] = day_payload['models']
+        day_cost: Optional[float] = None
+
+        if pricing_map is not None:
+            running_cost = 0.0
+            has_priced_model = False
+            for day_model_name, day_model_usage in day_models_usage.items():
+                _, day_pricing = resolve_model_pricing(day_model_name, pricing_map)
+                if day_pricing is None:
+                    continue
+                running_cost += calculate_usage_cost_usd(day_model_usage, day_pricing)
+                has_priced_model = True
+            if has_priced_model:
+                day_cost = running_cost
+
+        daily_rows.append({
+            'date': day_key,
+            'usage': day_payload['usage'],
+            'models': sorted(day_models_usage.keys()),
+            'usd': day_cost if pricing_enabled else None,
+        })
+
+    return {
+        'recent_days': recent_days,
+        'window_start_local': events_data['window_start_local'],
+        'window_end_local': events_data['window_end_local'],
+        'event_count': len(events),
+        'scanned_files': events_data['scanned_files'],
+        'parse_errors': events_data['parse_errors'],
+        'fallback_model': default_model,
+        'fallback_event_count': fallback_events,
+        'totals': totals,
+        'cost_enabled': pricing_enabled,
+        'usd_total': total_cost_usd if pricing_enabled and pricing_map is not None else None,
+        'pricing_url': pricing_url,
+        'pricing_source': pricing_source,
+        'pricing_warning': pricing_warning,
+        'priced_models': priced_models,
+        'unpriced_models': unpriced_models,
+        'models': model_breakdown,
+        'daily': daily_rows,
+    }
 
 
 def get_session_files_with_mtime(base_path: Path, days_back: int = 7) -> list:
@@ -265,7 +1019,10 @@ def format_token_usage(usage_data: Dict[str, int]) -> str:
     reasoning_tokens = usage_data.get('reasoning_output_tokens', 0)
     total_tokens = usage_data.get('total_tokens', 0)
 
-    return f"input {input_tokens}, cached {cached_tokens}, output {output_tokens}, reasoning {reasoning_tokens}, subtotal {total_tokens}"
+    return (
+        f"input {input_tokens:,}, cached {cached_tokens:,}, "
+        f"output {output_tokens:,}, reasoning {reasoning_tokens:,}, subtotal {total_tokens:,}"
+    )
 
 
 def calculate_reset_time(rate_limit: Dict[str, Any], record_timestamp: datetime) -> Tuple[datetime, float, bool]:
@@ -724,6 +1481,10 @@ def main():
     parser = argparse.ArgumentParser(description='Parse Claude Code session token usage and rate limits')
     parser.add_argument('--input-folder', '-i', type=str,
                        help='Custom input folder path (default: ~/.codex/sessions)')
+    parser.add_argument('--recent-days', type=int,
+                       help='Aggregate usage for recent N days (N=1 means today)')
+    parser.add_argument('--cost', action='store_true',
+                       help='Enable USD cost estimation from LiteLLM pricing map (off by default)')
     parser.add_argument('--live', action='store_true',
                        help='Launch TUI live monitoring interface')
     parser.add_argument('--interval', type=int, default=10,
@@ -748,6 +1509,81 @@ def main():
     # Launch TUI if --live flag is used
     if args.live:
         run_tui(base_path, args.interval, args.warning_threshold)
+        return
+
+    if args.recent_days is not None:
+        if args.recent_days <= 0:
+            if args.json:
+                print(json.dumps({"error": "--recent-days must be a positive integer"}))
+            else:
+                print("Error: --recent-days must be a positive integer.")
+            return
+
+        summary = summarize_recent_usage_with_cost(
+            base_path,
+            args.recent_days,
+            enable_cost=args.cost,
+        )
+        totals = summary['totals']
+
+        if args.json:
+            payload = {
+                "recent_days": summary['recent_days'],
+                "window_start_local": summary['window_start_local'].strftime('%Y-%m-%d %H:%M:%S%z'),
+                "window_end_local": summary['window_end_local'].strftime('%Y-%m-%d %H:%M:%S%z'),
+                "events": summary['event_count'],
+                "scanned_files": summary['scanned_files'],
+                "parse_errors": summary['parse_errors'],
+                "fallback_model": summary['fallback_model'],
+                "fallback_event_count": summary['fallback_event_count'],
+                "cost_enabled": summary['cost_enabled'],
+                "totals": {
+                    "input": totals.get('input_tokens', 0),
+                    "cached": totals.get('cached_input_tokens', 0),
+                    "output": totals.get('output_tokens', 0),
+                    "reasoning": totals.get('reasoning_output_tokens', 0),
+                    "subtotal": totals.get('total_tokens', 0),
+                },
+                "models": {},
+            }
+            if summary['cost_enabled']:
+                payload.update({
+                    "pricing_url": summary['pricing_url'],
+                    "pricing_source": summary['pricing_source'],
+                    "pricing_warning": summary['pricing_warning'],
+                    "usd_total": summary['usd_total'],
+                    "priced_models": summary['priced_models'],
+                    "unpriced_models": summary['unpriced_models'],
+                })
+            for model_name, model_data in summary['models'].items():
+                usage = model_data['usage']
+                model_payload = {
+                    "usage": {
+                        "input": usage.get('input_tokens', 0),
+                        "cached": usage.get('cached_input_tokens', 0),
+                        "output": usage.get('output_tokens', 0),
+                        "reasoning": usage.get('reasoning_output_tokens', 0),
+                        "subtotal": usage.get('total_tokens', 0),
+                    }
+                }
+                if summary['cost_enabled']:
+                    model_payload["usd"] = model_data.get('usd')
+                    model_payload["pricing_model"] = model_data.get('pricing_model')
+                payload['models'][model_name] = model_payload
+            print(json.dumps(payload, indent=2))
+        else:
+            window_start = summary['window_start_local'].strftime('%Y-%m-%d %H:%M:%S')
+            window_end = summary['window_end_local'].strftime('%Y-%m-%d %H:%M:%S')
+            print(f"Recent {summary['recent_days']} day(s) window: {window_start} -> {window_end}")
+            print(f"Events: {summary['event_count']} (scanned files: {summary['scanned_files']}, parse errors: {summary['parse_errors']})")
+            print(f"Fallback model: {summary['fallback_model']} (applied on {summary['fallback_event_count']} events)")
+            if summary['cost_enabled']:
+                if summary.get('pricing_source'):
+                    print(f"Pricing source: {summary['pricing_source']}")
+                if summary['pricing_warning']:
+                    print(f"Pricing warning: {summary['pricing_warning']}")
+
+            print(render_recent_usage_table(summary))
         return
 
     if not args.json:
