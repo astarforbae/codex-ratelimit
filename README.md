@@ -60,7 +60,7 @@ Commands used:
 
 ```bash
 # cxx 1 expands to:
-python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost
+python ratelimit_checker.py --recent-days 1 --cost
 
 # cx 1 expands to (for this benchmark date: 2026-03-18):
 NODE_USE_ENV_PROXY=1 npx -y @ccusage/codex@latest --since 20260318
@@ -71,15 +71,14 @@ Runtime benchmark (same machine):
 | Tool | Command | Real Time (s) | Speed vs ccusage |
 |---|---|---:|---:|
 | ccusage (`@ccusage/codex`) | `NODE_USE_ENV_PROXY=1 npx -y @ccusage/codex@latest --since 20260318` | 12.423 | 1.0x |
-| codex-ratelimit | `python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost` | 0.371 | 33.5x faster |
-| codex-ratelimit (relative path) | `python ratelimit_checker.py --recent-days 1 --cost` | 0.410 | 30.3x faster |
+| codex-ratelimit | `python ratelimit_checker.py --recent-days 1 --cost` | 0.371 | 33.5x faster |
 
 Result parity snapshot (same day, same timezone):
 
-- codex-ratelimit (`python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost`): `Cost = $98.87`
+- codex-ratelimit (`python ratelimit_checker.py --recent-days 1 --cost`): `Cost = $98.87`
 - ccusage (`NODE_USE_ENV_PROXY=1 npx -y @ccusage/codex@latest --since 20260318`): `Cost = $98.87`
 
-codex-ratelimit output (`python /home/xingyi/projects/scripts/codex-ratelimit/ratelimit_checker.py --recent-days 1 --cost`):
+codex-ratelimit output (`python ratelimit_checker.py --recent-days 1 --cost`):
 
 ```text
 Using default input folder: /home/xingyi/.codex/sessions
